@@ -1,29 +1,71 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { assessmentData } from "~/data/assessment-data";
+import { useCallback, useEffect, useState } from "react";
+import { api } from "~/lib/api";
+import { useDebounce } from "~/lib/hooks/useDebounce";
 import { useMockSession } from "~/lib/mock-session";
-import type { MovieStatus, PreviewChanges, Showtime, Theater } from "~/types/assessment";
+import type {
+  FilterOptions,
+  MovieStatus,
+  ShowtimePage,
+  ShowtimeSortField,
+  ShowtimeStatus,
+  SortOrder,
+  Theater,
+  UploadPreview,
+} from "~/types/assessment";
 import { FileUpload } from "./_components/FileUpload";
 import { FilterBar } from "./_components/FilterBar";
 import { PreviewModal } from "./_components/PreviewModal";
 import { ShowtimesTable } from "./_components/ShowtimesTable";
 
-const emptyPreview: PreviewChanges = {
-  adds: [],
-  updates: [],
-  archives: [],
+const movieStatusOptions: MovieStatus[] = [
+  "approved",
+  "draft",
+  "flagged",
+  "needs-review",
+];
+
+const emptyPage: ShowtimePage = {
+  items: [],
+  page: 1,
+  pageSize: 50,
+  total: 0,
+  totalPages: 0,
 };
 
-const uniqueSorted = (values: string[]) =>
-  [...new Set(values.filter(Boolean))].sort();
+const emptyFilterOptions: FilterOptions = {
+  formats: [],
+  languages: [],
+  ratings: [],
+  auditoriums: [],
+  movieStatuses: [],
+};
+
+const PAGE_SIZE = 50;
 
 export default function Home() {
-  const { user, userId, setUserId, signOut } = useMockSession();
-  const [showtimes, setShowtimes] = useState<Showtime[]>(assessmentData.showtimes);
+  const { users, usersError, user, userId, setUserId, signOut } =
+    useMockSession();
+  const [accessibleTheaters, setAccessibleTheaters] = useState<Theater[]>([]);
   const [selectedTheaterId, setSelectedTheaterId] = useState<string>("all");
+  const [showtimePage, setShowtimePage] = useState<ShowtimePage>(emptyPage);
+  const [filterOptions, setFilterOptions] =
+    useState<FilterOptions>(emptyFilterOptions);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const debouncedSearchQuery = useDebounce(searchQuery, 300);
+  const [sortField, setSortField] = useState<ShowtimeSortField>("start_time");
+  const [sortOrder, setSortOrder] = useState<SortOrder>("asc");
+  const [page, setPage] = useState(1);
+
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
-  const [previewData, setPreviewData] = useState<PreviewChanges>(emptyPreview);
+  const [preview, setPreview] = useState<UploadPreview | null>(null);
+  const [isApplying, setIsApplying] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   const [filters, setFilters] = useState({
     status: "all" as "active" | "inactive" | "archived" | "all",
@@ -37,159 +79,159 @@ export default function Home() {
   });
 
   const isAdmin = user?.role === "admin";
+  const reload = useCallback(() => setReloadKey((k) => k + 1), []);
 
-  const theatersById = useMemo(() => {
-    return assessmentData.theaters.reduce(
-      (acc, theater) => {
-        acc[theater.id] = theater;
-        return acc;
-      },
-      {} as Record<string, Theater>,
-    );
-  }, []);
-
-  const accessibleTheaters = useMemo(() => {
-    if (!user) return [];
-    return assessmentData.theaters.filter((theater) =>
-      user.theaterIds.includes(theater.id),
-    );
-  }, [user]);
-
-  const accessibleTheaterIds = useMemo(
-    () => new Set(accessibleTheaters.map((theater) => theater.id)),
-    [accessibleTheaters],
-  );
+  // Any change to what's being queried starts back at page 1.
+  useEffect(() => {
+    setPage(1);
+  }, [userId, selectedTheaterId, filters, debouncedSearchQuery, sortField, sortOrder]);
 
   useEffect(() => {
-    if (!user) return;
-    if (
-      selectedTheaterId !== "all" &&
-      !user.theaterIds.includes(selectedTheaterId)
-    ) {
-      setSelectedTheaterId("all");
-    }
-  }, [selectedTheaterId, user]);
+    setAccessibleTheaters([]);
+    setSelectedTheaterId("all");
+    // Non-admins can't sort/filter by movie status.
+    setSortField((field) => (field === "movie_status" ? "start_time" : field));
+    setFilters((current) => ({ ...current, movieStatus: "" }));
+    if (!userId) return;
+    api
+      .listTheaters(userId)
+      .then(setAccessibleTheaters)
+      .catch((err: Error) => setError(err.message));
+  }, [userId]);
 
-  const showtimesForUser = useMemo(() => {
-    if (!user) return [];
-    return showtimes.filter((showtime) =>
-      accessibleTheaterIds.has(showtime.theaterId),
-    );
-  }, [accessibleTheaterIds, showtimes, user]);
+  const theaterScope =
+    selectedTheaterId === "all" ? undefined : [selectedTheaterId];
 
-  const scopedShowtimes = useMemo(() => {
-    if (selectedTheaterId === "all") return showtimesForUser;
-    return showtimesForUser.filter(
-      (showtime) => showtime.theaterId === selectedTheaterId,
-    );
-  }, [selectedTheaterId, showtimesForUser]);
-
-  const filteredShowtimes = useMemo(() => {
-    let result = scopedShowtimes;
-
-    if (filters.status !== "all") {
-      result = result.filter((showtime) => showtime.status === filters.status);
+  useEffect(() => {
+    if (!userId) {
+      setShowtimePage(emptyPage);
+      return;
     }
-    if (filters.format) {
-      result = result.filter((showtime) => showtime.format === filters.format);
-    }
-    if (filters.language) {
-      result = result.filter(
-        (showtime) => showtime.language === filters.language,
-      );
-    }
-    if (filters.rating) {
-      result = result.filter((showtime) => showtime.rating === filters.rating);
-    }
-    if (filters.auditorium) {
-      result = result.filter(
-        (showtime) => showtime.auditorium === filters.auditorium,
-      );
-    }
-    if (filters.movieStatus) {
-      result = result.filter(
-        (showtime) => showtime.movieStatus === filters.movieStatus,
-      );
-    }
-    if (filters.startDate || filters.endDate) {
-      const startDate = filters.startDate
-        ? new Date(filters.startDate)
-        : null;
-      const endDate = filters.endDate ? new Date(filters.endDate) : null;
-      if (endDate) {
-        endDate.setHours(23, 59, 59, 999);
-      }
-
-      result = result.filter((showtime) => {
-        const showtimeDate = new Date(showtime.startTime);
-        if (startDate && showtimeDate < startDate) return false;
-        if (endDate && showtimeDate > endDate) return false;
-        return true;
+    let cancelled = false;
+    setIsLoading(true);
+    api
+      .searchShowtimes(userId, {
+        q: debouncedSearchQuery.trim() || undefined,
+        status: filters.status === "all" ? undefined : filters.status,
+        format: filters.format,
+        language: filters.language,
+        rating: filters.rating,
+        movieStatus:
+          isAdmin && filters.movieStatus
+            ? (filters.movieStatus as MovieStatus)
+            : undefined,
+        startDate: filters.startDate,
+        endDate: filters.endDate,
+        auditorium: filters.auditorium ? [filters.auditorium] : undefined,
+        theaterId: theaterScope,
+        sort: sortField,
+        order: sortOrder,
+        page,
+        pageSize: PAGE_SIZE,
+      })
+      .then((result) => {
+        if (cancelled) return;
+        setShowtimePage(result);
+        setError(null);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
       });
-    }
-
-    return result;
-  }, [filters, scopedShowtimes]);
-
-  const filterOptions = useMemo(() => {
-    return {
-      formats: uniqueSorted(scopedShowtimes.map((st) => st.format)),
-      languages: uniqueSorted(scopedShowtimes.map((st) => st.language)),
-      ratings: uniqueSorted(scopedShowtimes.map((st) => st.rating)),
-      auditoriums: uniqueSorted(scopedShowtimes.map((st) => st.auditorium)),
-      movieStatuses: uniqueSorted(scopedShowtimes.map((st) => st.movieStatus)),
+    return () => {
+      cancelled = true;
     };
-  }, [scopedShowtimes]);
+    // theaterScope is derived from selectedTheaterId
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    userId,
+    isAdmin,
+    selectedTheaterId,
+    filters,
+    debouncedSearchQuery,
+    sortField,
+    sortOrder,
+    page,
+    reloadKey,
+  ]);
 
-  const previewForTheater = useMemo(() => {
-    if (selectedTheaterId === "all") return emptyPreview;
-    return (
-      assessmentData.previewChangesByTheater[selectedTheaterId] ?? emptyPreview
-    );
-  }, [selectedTheaterId]);
+  useEffect(() => {
+    if (!userId) return;
+    api
+      .filterOptions(userId, theaterScope)
+      .then(setFilterOptions)
+      .catch(() => setFilterOptions(emptyFilterOptions));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, selectedTheaterId, reloadKey]);
 
-  const handleFileSelect = (_content: string) => {
-    setPreviewData(previewForTheater);
-    setIsPreviewOpen(true);
+  const handleFileSelect = async (file: File) => {
+    if (!userId || selectedTheaterId === "all") return;
+    setPreviewError(null);
+    try {
+      const staged = await api.uploadShowtimes(userId, file, selectedTheaterId);
+      setPreview(staged);
+      setIsPreviewOpen(true);
+    } catch (err) {
+      setError(`Upload failed: ${(err as Error).message}`);
+    }
   };
 
-  const handleConfirmChanges = () => {
-    setIsPreviewOpen(false);
+  const handleConfirmChanges = async () => {
+    if (!userId || !preview) return;
+    setIsApplying(true);
+    setPreviewError(null);
+    try {
+      await api.commitUpload(userId, preview.uploadId);
+      setIsPreviewOpen(false);
+      setPreview(null);
+      reload();
+    } catch (err) {
+      setPreviewError((err as Error).message);
+    } finally {
+      setIsApplying(false);
+    }
   };
 
-  const handleClearSchedule = () => {
+  const handleClearSchedule = async () => {
+    if (!userId) return;
     if (selectedTheaterId === "all") {
       alert("Select a single theater before clearing the schedule.");
       return;
     }
     if (
-      confirm(
+      !confirm(
         "Are you sure you want to archive all showtimes for this theater?",
       )
     ) {
-      setShowtimes((current) =>
-        current.map((showtime) =>
-          showtime.theaterId === selectedTheaterId
-            ? { ...showtime, status: "archived" }
-            : showtime,
-        ),
-      );
+      return;
+    }
+    try {
+      await api.clearSchedule(userId, selectedTheaterId);
+      reload();
+    } catch (err) {
+      setError((err as Error).message);
     }
   };
 
-  const handleMovieStatusChange = (showtimeId: string, status: MovieStatus) => {
-    setShowtimes((current) =>
-      current.map((showtime) =>
-        showtime.id === showtimeId
-          ? { ...showtime, movieStatus: status }
-          : showtime,
-      ),
-    );
+  const updateShowtime = async (
+    showtimeId: string,
+    patch: { movieStatus?: MovieStatus; status?: ShowtimeStatus },
+  ) => {
+    if (!userId) return;
+    try {
+      const updated = await api.updateShowtime(userId, showtimeId, patch);
+      setShowtimePage((current) => ({
+        ...current,
+        items: current.items.map((showtime) =>
+          showtime.id === updated.id ? updated : showtime,
+        ),
+      }));
+    } catch (err) {
+      setError((err as Error).message);
+    }
   };
-
-  const activeCount = filteredShowtimes.filter(
-    (showtime) => showtime.status === "active",
-  ).length;
 
   const statusOptions = ["active", "inactive", "archived"] as const;
 
@@ -217,7 +259,7 @@ export default function Home() {
                 <option value="" disabled>
                   Select a user
                 </option>
-                {assessmentData.users.map((candidate) => (
+                {users.map((candidate) => (
                   <option key={candidate.id} value={candidate.id}>
                     {candidate.name} ({candidate.role})
                   </option>
@@ -238,7 +280,8 @@ export default function Home() {
                     </span>
                   </div>
                   <div className="mt-1 text-xs text-gray-500">
-                    Theaters: {user.theaterIds.length || 0}
+                    Theaters:{" "}
+                    {user.canViewAll ? "All" : user.theaterIds.length || 0}
                   </div>
                 </div>
               ) : (
@@ -298,9 +341,9 @@ export default function Home() {
           </button>
 
           <div className="ml-auto text-sm text-gray-400">
-            {filteredShowtimes.length > 0 && (
+            {showtimePage.total > 0 && (
               <>
-                {activeCount} active showtimes
+                {showtimePage.total} showtimes
                 {selectedTheaterId === "all" ? " across theaters" : ""}
               </>
             )}
@@ -311,6 +354,14 @@ export default function Home() {
           <div className="mb-6 rounded-lg border border-gray-700 bg-gray-900 p-4 text-sm text-gray-400">
             You are in read-only mode. Admin users can upload CSVs and update
             movie status.
+          </div>
+        )}
+
+        {(usersError ?? error) && (
+          <div className="mb-6 rounded-lg border border-red-700 bg-red-950/40 p-4 text-sm text-red-300">
+            {usersError
+              ? `Could not reach the API: ${usersError}. Is the backend running on port 8000?`
+              : error}
           </div>
         )}
 
@@ -334,31 +385,37 @@ export default function Home() {
               availableLanguages={filterOptions.languages}
               availableRatings={filterOptions.ratings}
               availableAuditoriums={filterOptions.auditoriums}
-              availableMovieStatuses={filterOptions.movieStatuses}
+              availableMovieStatuses={isAdmin ? movieStatusOptions : []}
             />
 
             <div className="rounded-lg border border-gray-700 bg-gray-900 p-6">
               <ShowtimesTable
-                showtimes={filteredShowtimes}
-                theatersById={theatersById}
+                showtimes={showtimePage.items}
                 showTheaterColumn={selectedTheaterId === "all"}
                 isAdmin={!!isAdmin}
-                movieStatusOptions={assessmentData.movieStatusOptions}
+                isLoading={isLoading}
+                movieStatusOptions={movieStatusOptions}
                 statusOptions={statusOptions}
+                searchQuery={searchQuery}
+                onSearchChange={setSearchQuery}
+                sortField={sortField}
+                sortOrder={sortOrder}
+                onSortChange={(field, order) => {
+                  setSortField(field);
+                  setSortOrder(order);
+                }}
+                page={showtimePage.page}
+                totalPages={showtimePage.totalPages}
+                total={showtimePage.total}
+                onPageChange={setPage}
                 onMovieStatusChange={
-                  isAdmin ? handleMovieStatusChange : undefined
+                  isAdmin
+                    ? (id, movieStatus) => updateShowtime(id, { movieStatus })
+                    : undefined
                 }
                 onStatusChange={
                   isAdmin
-                    ? (showtimeId, status) => {
-                        setShowtimes((current) =>
-                          current.map((showtime) =>
-                            showtime.id === showtimeId
-                              ? { ...showtime, status }
-                              : showtime,
-                          ),
-                        );
-                      }
+                    ? (id, status) => updateShowtime(id, { status })
                     : undefined
                 }
               />
@@ -370,8 +427,9 @@ export default function Home() {
           isOpen={isPreviewOpen}
           onClose={() => setIsPreviewOpen(false)}
           onConfirm={handleConfirmChanges}
-          changes={previewData}
-          isApplying={false}
+          preview={preview}
+          isApplying={isApplying}
+          error={previewError}
         />
       </div>
     </main>
